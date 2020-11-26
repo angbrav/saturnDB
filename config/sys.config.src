@@ -1,0 +1,59 @@
+%% -*- erlang -*-
+[
+%% logger config
+  {kernel, [
+    {logger, [
+
+      {handler, default, logger_std_h,
+        #{level => info,
+          formatter => {logger_formatter, #{single_line => false, max_size => 2048}},
+          config => #{type => standard_io}}},
+
+      {handler, debug, logger_std_h,
+        #{level => info,
+          formatter => {logger_formatter, #{single_line => true, max_size => 2048}},
+          config => #{type => {file, "${ROOT_DIR_PREFIX}${LOGGER_DIR_PREFIX}logger_logs/info.log"}}}},
+
+      {handler, errors, logger_std_h,
+        #{level => error,
+          formatter => {logger_formatter, #{single_line => false, max_size => 2048}},
+          config => #{type => {file, "${ROOT_DIR_PREFIX}${LOGGER_DIR_PREFIX}logger_logs/errors.log"}}}}
+    ]},
+    {logger_level, info}
+  ]},
+
+ %% Riak Core config
+ {riak_core, [
+               %% riak directories
+              {ring_state_dir, "${ROOT_DIR_PREFIX}${DATA_DIR_PREFIX}data_riak_core"},
+              {platform_data_dir, "${ROOT_DIR_PREFIX}${DATA_DIR_PREFIX}data_riak_core"},
+
+              {ring_creation_size, 8},
+
+              %% riak_handoff_port is the TCP port that Riak uses for
+              %% intra-cluster data handoff.
+              {handoff_port, 8099}
+             ]},
+
+ {setup, [
+    %% stops setup from creating strange folders (data@node() and log@node())
+    {verify_directories, false}
+ ]},
+
+ {saturn_leaf, [
+            %% antidote data directory
+           {data_dir, "${ROOT_DIR_PREFIX}${DATA_DIR_PREFIX}data_antidote"}
+
+           %{riak_port, {{riak_port}} },
+           %{riak_node, '127.0.0.1'}
+          ]},
+
+ %% SASL config
+ {sasl, [
+         {sasl_error_logger, {file, "log/sasl-error.log"}},
+         {errlog_type, error},
+         {error_logger_mf_dir, "log/sasl"},      % Log directory
+         {error_logger_mf_maxbytes, 10485760},   % 10 MB max file size
+         {error_logger_mf_maxfiles, 5}           % 5 files max
+        ]}
+].
