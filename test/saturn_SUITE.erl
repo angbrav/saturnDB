@@ -100,6 +100,8 @@ replication(Config) ->
     Result2 = gen_server:call(server_name(Leaf1), {update, BKey, 3, 0}, infinity),
     ?assertMatch({ok, _Clock1}, Result2),
 
+    %timer:sleep(10000),
+
     Result3 = gen_server:call(server_name(Leaf1), {read, BKey, 0}, infinity),
     ?assertMatch({ok, {3, _Clock1}}, Result3),
 

@@ -127,14 +127,17 @@ init_multi_dc(Suite, Config0) ->
     ok = wait_for_name(list_to_atom("0saturn_leaf_producer")),
     ok = rpc:call(Leaf1, saturn_leaf_producer, check_ready, [0]),
     ok = wait_for_name(list_to_atom("0saturn_leaf_receiver")),
+    ok = wait_for_name(list_to_atom("0saturn_leaf_converger")),
     
 
     {ok, _} = rpc:call(Leaf2, saturn_leaf_sup, start_leaf, [web_ports(dev2)+1, 1, true, true]),
     ok = wait_for_name(list_to_atom("1saturn_leaf_producer")),
     ok = rpc:call(Leaf2, saturn_leaf_producer, check_ready, [1]),
     ok = wait_for_name(list_to_atom("1saturn_leaf_receiver")),
+    ok = wait_for_name(list_to_atom("1saturn_leaf_converger")),
 
     {ok, _} = rpc:call(Internal1, saturn_leaf_sup, start_internal, [web_ports(dev3)+1, 2]),
+    ok = wait_for_name(list_to_atom("2saturn_internal_serv")),
 
     ok = rpc:call(Leaf1, saturn_leaf_receiver, assign_convergers, [0, 2]),
     ok = rpc:call(Leaf2, saturn_leaf_receiver, assign_convergers, [1, 2]),

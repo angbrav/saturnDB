@@ -196,6 +196,7 @@ propagate_stream(FinalStream, MyId, Manager) ->
         {ok, _, no_indexnode} ->
             noop;
         {ok, Stream, Id} ->
+            ?LOG_INFO("~p sending new stream: ~p to ~p.", [MyId, Stream, Id]),
             saturn_internal_serv:handle(Id, {new_stream, Stream, MyId})
     end.
 
