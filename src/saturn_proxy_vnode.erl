@@ -289,8 +289,8 @@ handle_command({read, BKey, Clock}, From, S0) ->
             {noreply, S1}
     end;
 
-handle_command({async_read, BKey, Clock, Client}, _From, S0) ->
-    case do_read(async, BKey, Clock, Client, S0) of
+handle_command({async_read, BKey, LClock, Client}, _From, S0) ->
+    case do_read(async, BKey, LClock, Client, S0) of
         {error, Reason} ->
             gen_server:reply(Client, {error, Reason}),
             {noreply, S0};
@@ -327,13 +327,12 @@ handle_command({propagate, TimeStamp, Node, Sender, RClock}, _From, S0=#state{my
             {noreply, S0#state{remote_updates=RemoteUpdates1}}
     end;
 
-handle_command({new_remote_clock, Clock}, _From, S0=#state{remote_clock=RClock0, remote_updates=RemoteUpdates0, myid=MyId, connector=Connector0, staleness=Staleness0, remote_reads=RemoteReads0, partition=Partition, last_label=LastLabel0, max_ts=MaxTs}) ->
+handle_command({new_remote_clock, Clock}, _From, S0=#state{remote_clock=RClock0}) ->
     ?LOG_INFO("New remote clock. New clock ~p, old clock ~p.", [Clock, RClock0]),
     case Clock > RClock0 of
         true ->
-            {RemoteUpdates1, Connector1, Staleness1} = process_pending_remote_updates(RemoteUpdates0, Clock, MyId, Connector0, Staleness0),
-            {RemoteReads1, TimeStamp, LastLabel1, Staleness2} = process_pending_remote_reads(RemoteReads0, Clock, MaxTs, MyId, Partition, Connector1, Staleness1, LastLabel0),
-            {noreply, S0#state{connector=Connector1, staleness=Staleness2, remote_updates=RemoteUpdates1, remote_clock=Clock, remote_reads=RemoteReads1, max_ts=TimeStamp, last_label=LastLabel1}};
+            S1 = do_update_rclock(Clock, S0),
+            {noreply, S1};
         false ->    
             {noreply, S0}
     end;
@@ -486,6 +485,11 @@ do_remote_read(Label, MaxTS0, MyId, Partition, Connector, Staleness) ->
     NewLabel = create_label(remote_reply, {routing, routing}, TimeStamp, {Partition, node()}, MyId, #payload_reply{value=Value, to=Sender, client=Client, type_call=Type}),
     saturn_leaf_producer:new_label(MyId, NewLabel, Partition, false),
     {TimeStamp, NewLabel, Staleness1}.
+
+do_update_rclock(Clock, S0=#state{remote_updates=RemoteUpdates0, myid=MyId, connector=Connector0, staleness=Staleness0, remote_reads=RemoteReads0, partition=Partition, last_label=LastLabel0, max_ts=MaxTs0}) ->
+    {RemoteUpdates1, Connector1, Staleness1} = process_pending_remote_updates(RemoteUpdates0, Clock, MyId, Connector0, Staleness0),
+    {RemoteReads1, MaxTs1, LastLabel1, Staleness2} = process_pending_remote_reads(RemoteReads0, Clock, MaxTs0, MyId, Partition, Connector1, Staleness1, LastLabel0),
+    S0#state{connector=Connector1, staleness=Staleness2, remote_updates=RemoteUpdates1, remote_reads=RemoteReads1, max_ts=MaxTs1, last_label=LastLabel1, remote_clock=Clock}.
 
 process_pending_remote_updates([], _, _, Connector0, Staleness0) ->
     {[], Connector0, Staleness0};
