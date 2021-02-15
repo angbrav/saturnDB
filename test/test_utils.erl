@@ -145,6 +145,9 @@ init_multi_dc(Suite, Config0) ->
     ok = wait_until_ring_ready(Leaf1),
     ok = wait_until_ring_ready(Leaf2),
 
+    ok = rpc:call(Leaf1, saturn_leaf, start_dissemination, []),
+    ok = rpc:call(Leaf2, saturn_leaf, start_dissemination, []),
+
     %DocIdx = rpc:call(Leaf1, riak_core_util, chash_key, [{1, key1}]),
     %IndexNode1 = rpc:call(Leaf1, riak_core_apl, get_primary_apl, [DocIdx, 1, saturn_proxy]),
     %IndexNode2 = rpc:call(Leaf2, riak_core_apl, get_primary_apl, [DocIdx, 1, saturn_proxy]),

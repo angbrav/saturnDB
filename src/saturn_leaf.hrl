@@ -27,6 +27,7 @@
 
 -define(HEARTBEAT_FREQ, 2).
 -define(STABILIZATION_FREQ, 1).
+-define(EUNOMIA_FREQ, 5).
 
 %-define(PROPAGATION_MODE, naive_erlang).
 -define(PROPAGATION_MODE, bypass_tree).

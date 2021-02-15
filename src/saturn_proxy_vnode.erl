@@ -47,7 +47,7 @@
          handle_overload_info/2]).
 
 -export([read/3,
-         async_read/4,
+         async_read/5,
          update/4,
          async_update/5,
          propagate/5,
@@ -60,12 +60,17 @@
          set_groups/2,
          clean_state/1,
          set_receivers/2,
+         children_appliedclocks/2,
          data/4,
          collect_stats/3,
          collect_staleness/1,
-         check_ready/1]).
+         check_ready/1,
+         start_dissemination/1]).
 
 -record(state, {partition,
+                parent,
+                applied_clocks,
+                gathered_clocks,
                 max_ts,
                 connector,
                 last_label,
@@ -117,9 +122,9 @@ read(Node, BKey, Clock) ->
                                         {read, BKey, Clock},
                                         ?PROXY_MASTER).
 
-async_read(Node, BKey, Clock, Client) ->
+async_read(Node, BKey, LClock, RClock, Client) ->
     riak_core_vnode_master:command(Node,
-                                   {async_read, BKey, Clock, Client},
+                                   {async_read, BKey, LClock, RClock, Client},
                                    {fsm, undefined, self()},
                                    ?PROXY_MASTER).
 
@@ -180,6 +185,16 @@ collect_staleness(Node) ->
                                         collect_staleness,
                                         ?PROXY_MASTER).
 
+start_dissemination(Node) ->
+    riak_core_vnode_master:sync_command(Node,
+                                        start_dissemination,
+                                        ?PROXY_MASTER).
+
+children_appliedclocks(Node, Clocks) ->
+    riak_core_vnode_master:sync_command(Node,
+                                        {children_appliedclocks, Clocks},
+                                        ?PROXY_MASTER).
+
 init([Partition]) ->
     Manager = groups_manager:init_state(integer_to_list(Partition)),
     Connector = ?BACKEND_CONNECTOR:connect([Partition]),
@@ -187,8 +202,14 @@ init([Partition]) ->
     Data = ets:new(Name1, [bag, named_table, private]),
     NameStaleness = list_to_atom(integer_to_list(Partition) ++ atom_to_list(staleness)),
     Staleness = ?STALENESS:init(NameStaleness),
+    {ok, Ring} = riak_core_ring_manager:get_my_ring(),
+    GrossPrefLists = riak_core_ring:all_preflists(Ring, 1),
+    Parent = find_parent(GrossPrefLists, node()),
     ?LOG_INFO("Vnode init ~p", [self()]),
     {ok, #state{partition=Partition,
+                parent=Parent,
+                applied_clocks=[],
+                gathered_clocks=[],
                 max_ts=0,
                 last_label=none,
                 connector=Connector,
@@ -209,7 +230,6 @@ check_ready(Function) ->
     PartitionList = chashbin:to_list(CHBin),
     check_ready_partition(PartitionList, Function).
 
-
 check_ready_partition([], _Function) ->
     true;
 check_ready_partition([{Partition, Node} | Rest], Function) ->
@@ -223,6 +243,10 @@ check_ready_partition([{Partition, Node} | Rest], Function) ->
         false ->
             false
     end.
+
+handle_command(start_dissemination, _Sender, S0) ->
+    riak_core_vnode:send_command_after(?EUNOMIA_FREQ, periodic_dissemination),
+    {reply, ok, S0};
 
 handle_command({check_tables_ready}, _Sender, SD0) ->
     {reply, true, SD0};
@@ -261,19 +285,25 @@ handle_command({set_groups, Groups}, _From, S0=#state{manager=Manager}) ->
     ok = groups_manager:set_groups(Table, Groups),
     {reply, ok, S0};
 
+handle_command({children_appliedclocks, Clocks}, _From, S0=#state{gathered_clocks=List0}) ->
+    ?LOG_INFO("Received applied clocks ~p.", [Clocks]),
+    List1 = lists:merge(List0, Clocks), 
+    {noreply, S0#state{gathered_clocks=List1}};
+
 handle_command({data, Id, BKey, Value}, _From, S0=#state{data=Data,
                                                          pending=Pending0,
-                                                         myid=MyId,
+                                                         applied_clocks=AppliedClocks0,
                                                          remote_updates=RemoteUpdates0}) ->
     ?LOG_INFO("Remote data. key ~p, value ~p.", [BKey, Value]),
     case lists:reverse(Pending0) of
         [{Id, {Sender, Clock}}|Tail] ->
             {TimeStamp, _} = Id,
             RemoteUpdates1 = orddict:store(Clock, {BKey, Value, TimeStamp, Sender}, RemoteUpdates0),
-            {RemoteUpdates2, Pending1, AppliedClock} = process_pending_metadata(Tail, Data, RemoteUpdates1, [Clock]),
+            {RemoteUpdates2, Pending1, AppliedClocks1} = process_pending_metadata(Tail, Data, RemoteUpdates1, [Clock]),
             %{RemoteUpdates2, Connector1, Staleness1} = process_pending_remote_updates(RemoteUpdates1, RClock, MyId, Connector0, Staleness0),
-            saturn_leaf_converger:handle(MyId, {completed, AppliedClock}),
-            {noreply, S0#state{remote_updates=RemoteUpdates2, pending=Pending1}};
+            AppliedClocks2 = [AppliedClocks1 | AppliedClocks0],
+            %saturn_leaf_converger:handle(MyId, {completed, AppliedClock}),
+            {noreply, S0#state{remote_updates=RemoteUpdates2, pending=Pending1, applied_clocks=AppliedClocks2}};
         _ ->
             true = ets:insert(Data, {Id, {BKey, Value}}),
             {noreply, S0}
@@ -289,17 +319,23 @@ handle_command({read, BKey, Clock}, From, S0) ->
             {noreply, S1}
     end;
 
-handle_command({async_read, BKey, LClock, Client}, _From, S0) ->
-    case do_read(async, BKey, LClock, Client, S0) of
+handle_command({async_read, BKey, LClock, ClientRClock, Client}, _From, S0=#state{remote_clock=RClock}) ->
+    case ClientRClock > RClock of
+        true ->
+            S1 = do_update_rclock(ClientRClock, S0);
+        false ->    
+            S1 = S0 
+    end,
+    case do_read(async, BKey, LClock, Client, S1) of
         {error, Reason} ->
             gen_server:reply(Client, {error, Reason}),
-            {noreply, S0};
+            {noreply, S1};
         {ok, Value} ->
-            gen_server:reply(Client, {ok, Value}),
-            {noreply, S0};
-        {remote, S1} ->
+            gen_server:reply(Client, {ok, Value, S1#state.remote_clock}),
+            {noreply, S1};
+        {remote, S2} ->
             %gen_server:reply(Client, {ok, {value, 0}}),
-            {noreply, S1}
+            {noreply, S2}
     end;
 
 handle_command({update, BKey, Value, Clock}, _From, S0) ->
@@ -311,7 +347,7 @@ handle_command({async_update, BKey, Value, Clock, Client}, _From, S0) ->
     gen_server:reply(Client, {ok, TimeStamp}),
     {noreply, S1};
 
-handle_command({propagate, TimeStamp, Node, Sender, RClock}, _From, S0=#state{myid=MyId, data=Data, pending=Pending, remote_updates=RemoteUpdates0}) ->
+handle_command({propagate, TimeStamp, Node, Sender, RClock}, _From, S0=#state{data=Data, pending=Pending, remote_updates=RemoteUpdates0, applied_clocks=AppliedClocks}) ->
     Id = {TimeStamp, Node},
     ?LOG_INFO("Remote metadata. Clock ~p.", [RClock]),
     case ets:lookup(Data, Id) of
@@ -322,9 +358,11 @@ handle_command({propagate, TimeStamp, Node, Sender, RClock}, _From, S0=#state{my
             RemoteUpdates1 = orddict:store(RClock, {BKey, Value, TimeStamp, Sender}, RemoteUpdates0),
             case Pending of
                 [] ->
-                    saturn_leaf_converger:handle(MyId, {completed, [RClock]})
-            end,
-            {noreply, S0#state{remote_updates=RemoteUpdates1}}
+                    %saturn_leaf_converger:handle(MyId, {completed, [RClock]})
+                    {noreply, S0#state{remote_updates=RemoteUpdates1, applied_clocks=[RClock | AppliedClocks]}};
+                _ ->
+                    {noreply, S0#state{remote_updates=RemoteUpdates1}}
+            end
     end;
 
 handle_command({new_remote_clock, Clock}, _From, S0=#state{remote_clock=RClock0}) ->
@@ -357,6 +395,28 @@ handle_command(heartbeat, _From, S0=#state{partition=Partition, max_ts=MaxTS0, m
         false ->
             riak_core_vnode:send_command_after(?HEARTBEAT_FREQ, heartbeat),
             {noreply, S0}
+    end;
+
+handle_command(periodic_dissemination, _From, S0=#state{parent=Parent, partition=Partition, applied_clocks=AppliedClocks, gathered_clocks=GatheredClocks0, myid=MyId}) ->
+    ?LOG_INFO("Periodic dissemination", []),
+    riak_core_vnode:send_command_after(?EUNOMIA_FREQ, periodic_dissemination),
+    case Parent of
+        Partition ->
+            case lists:merge(GatheredClocks0, lists:reverse(AppliedClocks)) of
+                [] ->
+                    {noreply, S0};
+                GatheredClocks1 ->
+                    saturn_leaf_converger:handle(MyId, {completed, GatheredClocks1}),
+                    {noreply, S0#state{applied_clocks=[], gathered_clocks=[]}}
+            end;
+        _ ->
+            case AppliedClocks of
+                [] ->
+                    {noreply, S0};
+                _ ->
+                    saturn_proxy_vnode:children_appliedclocks({Parent, node()}, lists:reverse(AppliedClocks)),
+                    {noreply, S0#state{applied_clocks=[]}}
+            end
     end;
 
 handle_command(last_label, _Sender, S0=#state{last_label=LastLabel}) ->
@@ -515,7 +575,7 @@ process_pending_remote_reads(RemoteReads, _, MaxTs0, _, _, _, Staleness0, LastLa
     {RemoteReads, MaxTs0, LastLabel0, Staleness0}.
 
 process_pending_metadata([], _, RemoteUpdates0, AppliedClock) ->
-    {RemoteUpdates0, [], lists:reverse(AppliedClock)};
+    {RemoteUpdates0, [], AppliedClock};
 
 process_pending_metadata([{Id, {Sender, Clock, _}}|Rest]=Pending, Data, RemoteUpdates0, AppliedClock) ->
     case ets:lookup(Data, Id) of
@@ -524,5 +584,17 @@ process_pending_metadata([{Id, {Sender, Clock, _}}|Rest]=Pending, Data, RemoteUp
             RemoteUpdates1 = orddict:store(Clock, {BKey, Value, TimeStamp, Sender}, RemoteUpdates0),
             process_pending_metadata(Rest, Data, RemoteUpdates1, [Clock|AppliedClock]);
         [] ->
-            {RemoteUpdates0, lists:reverse(Pending), lists:reverse(AppliedClock)}
+            {RemoteUpdates0, lists:reverse(Pending), AppliedClock}
+    end.
+
+find_parent([], MyNode) ->
+    ?LOG_INFO("No partition in my node ~p", [MyNode]);
+    
+find_parent([Head|Rest], MyNode) ->
+    {Index, Node} = hd(Head),
+    case Node of
+        MyNode ->
+            Index;
+        _ ->
+            find_parent(Rest, MyNode)
     end.

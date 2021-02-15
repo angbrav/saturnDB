@@ -61,7 +61,7 @@ init([MyId]) ->
     Dict = lists:foldl(fun(PrefList, Acc) ->
                         dict:store(hd(PrefList), 0, Acc)
                        end, dict:new(), GrossPrefLists),
-    erlang:send_after(10, self(), notify),
+    erlang:send_after(?EUNOMIA_FREQ, self(), notify),
     {ok, #state{pending_timestamps=[],
                 stable=0,
                 old_stable=0,
@@ -74,9 +74,7 @@ handle_call(clean_state, _From, S0) ->
 
 handle_cast({completed, TimeStamps0}, S0=#state{stable=Stable0, pending_timestamps=PendingTS0}) ->
     {TimeStamps1, Stable1} = update_stable(TimeStamps0, Stable0),
-    PendingTS1 = orddict:merge(fun(_K, V1, _V2) ->
-                                    V1
-                               end, PendingTS0, TimeStamps1), 
+    PendingTS1 = lists:merge(PendingTS0, TimeStamps1),
     {PendingTS2, Stable2} = update_stable(PendingTS1, Stable1),
     {noreply, S0#state{stable=Stable2, pending_timestamps=PendingTS2}};
 
@@ -134,7 +132,7 @@ handle_label(Label, RClock) ->
                     %noop;
                     riak_core_vnode:reply(Client, {ok, {Value, 0}});
                 async ->
-                    gen_server:reply(Client, {ok, {Value, 0}})
+                    gen_server:reply(Client, {ok, {Value, 0}, RClock})
                     %noop
             end,
             RClock;

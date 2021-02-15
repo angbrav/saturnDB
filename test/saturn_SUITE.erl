@@ -73,17 +73,17 @@ all() ->
 server_name(Node)->
     {saturn_client_receiver, Node}.
 
-eventual_read(Key, Node, ExpectedResult) ->
-    eventual_read(Key, Node, ExpectedResult, 0).
+eventual_read(Key, RClock, Node, ExpectedResult) ->
+    eventual_read(Key, Node, ExpectedResult, 0, RClock).
 
-eventual_read(Key, Node, ExpectedResult, Clock) ->
-    Result = gen_server:call(server_name(Node), {read, Key, Clock}, infinity),
+eventual_read(Key, Node, ExpectedResult, LClock, RClock) ->
+    Result = gen_server:call(server_name(Node), {read, Key, LClock, RClock}, infinity),
     case Result of
-        {ok, {ExpectedResult, _Clock}} -> Result;
-        _ ->
+        {ok, {ExpectedResult, _Clock}, RClock1} -> Result;
+        {ok, {_, _}, RClock1} ->
             ct:print("I read: ~p, expecting: ~p",[Result, ExpectedResult]),
             timer:sleep(500),
-            eventual_read(Key, Node, ExpectedResult)
+            eventual_read(Key, RClock1, Node, ExpectedResult)
     end.
 
 replication(Config) ->
@@ -93,8 +93,8 @@ replication(Config) ->
     [Leaf1 | Leaf2] = proplists:get_value(leafs, Config),
 
     %% Reading a key thats empty
-    Result1 = gen_server:call(server_name(Leaf1), {read, BKey, 0}, infinity),
-    ?assertMatch({ok, {empty, 0}}, Result1),
+    Result1 = gen_server:call(server_name(Leaf1), {read, BKey, 0, 0}, infinity),
+    ?assertMatch({ok, {empty, 0}, 0}, Result1),
 
     %% Update key
     Result2 = gen_server:call(server_name(Leaf1), {update, BKey, 3, 0}, infinity),
@@ -102,11 +102,11 @@ replication(Config) ->
 
     %timer:sleep(10000),
 
-    Result3 = gen_server:call(server_name(Leaf1), {read, BKey, 0}, infinity),
-    ?assertMatch({ok, {3, _Clock1}}, Result3),
+    Result3 = gen_server:call(server_name(Leaf1), {read, BKey, 0, 0}, infinity),
+    ?assertMatch({ok, {3, _Clock1}, 0}, Result3),
 
-    Result4 = eventual_read(BKey, Leaf2, 3),
-    ?assertMatch({ok, {3, _Clock1}}, Result4).
+    Result4 = eventual_read(BKey, 0, Leaf2, 3),
+    ?assertMatch({ok, {3, _Clock1}, 1}, Result4).
 
 remote_read(Config) ->
     ct:print("Starting test remote_read", []),
@@ -115,17 +115,17 @@ remote_read(Config) ->
     [Leaf1 | Leaf2] = proplists:get_value(leafs, Config),
 
     %% Reading a key thats empty
-    Result1 = gen_server:call(server_name(Leaf1), {read, BKey, 0}, infinity),
-    ?assertMatch({ok, {empty, 0}}, Result1),
+    Result1 = gen_server:call(server_name(Leaf1), {read, BKey, 0, 0}, infinity),
+    ?assertMatch({ok, {empty, 0}, 0}, Result1),
 
     %% Update key
     Result2 = gen_server:call(server_name(Leaf1), {update, BKey, 3, 0}, infinity),
     ?assertMatch({ok, _Clock1}, Result2),
 
-    Result3 = gen_server:call(server_name(Leaf1), {read, BKey, 0}, infinity),
-    ?assertMatch({ok, {3, _Clock1}}, Result3),
+    Result3 = gen_server:call(server_name(Leaf1), {read, BKey, 0, 0}, infinity),
+    ?assertMatch({ok, {3, _Clock1}, 0}, Result3),
 
     ct:print("About to perform the remote read", []),
 
-    Result4 = eventual_read(BKey, Leaf2, 3),
-    ?assertMatch({ok, {3, _Clock1}}, Result4).
+    Result4 = eventual_read(BKey, 0, Leaf2, 3),
+    ?assertMatch({ok, {3, _Clock1}, 1}, Result4).

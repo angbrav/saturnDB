@@ -6,12 +6,13 @@
          ping/0,
          update/3,
          read/2,
-         async_read/3,
+         async_read/4,
          async_update/4,
          clean/1,
          collect_stats/2,
          staleness_average/0,
-         spawn_wrapper/4
+         spawn_wrapper/4,
+         start_dissemination/0
         ]).
 
 %% Public API
@@ -41,11 +42,19 @@ async_update({Bucket, Key}, Value, Clock, Client) ->
     [{IndexNode, _Type}] = PrefList,
     saturn_proxy_vnode:async_update(IndexNode, {Bucket, Key}, Value, Clock, Client).
     
-async_read({Bucket, Key}, Clock, Client) ->
+async_read({Bucket, Key}, LClock, RClock, Client) ->
     DocIdx = riak_core_util:chash_key({Bucket, Key}),
     PrefList = riak_core_apl:get_primary_apl(DocIdx, 1, ?PROXY_SERVICE),
     [{IndexNode, _Type}] = PrefList,
-    saturn_proxy_vnode:async_read(IndexNode, {Bucket, Key}, Clock, Client).
+    saturn_proxy_vnode:async_read(IndexNode, {Bucket, Key}, LClock, RClock, Client).
+
+start_dissemination() ->
+    {ok, Ring} = riak_core_ring_manager:get_my_ring(),
+    GrossPrefLists = riak_core_ring:all_preflists(Ring, 1),
+    lists:foreach(fun(PrefList) ->
+                    ok = saturn_proxy_vnode:start_dissemination(hd(PrefList))
+                  end, GrossPrefLists),
+    ok.
 
 clean(MyId) ->
     ok = saturn_leaf_producer:clean_state(MyId), 
