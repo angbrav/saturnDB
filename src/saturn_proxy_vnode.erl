@@ -51,6 +51,8 @@
          update/4,
          async_update/5,
          propagate/5,
+         leader_batches/3,
+         remote_batch/3,
          new_remote_clock/2,
          heartbeat/1,
          init_proxy/2,
@@ -69,6 +71,7 @@
 
 -record(state, {partition,
                 parent,
+                children,
                 applied_clocks,
                 gathered_clocks,
                 max_ts,
@@ -191,9 +194,22 @@ start_dissemination(Node) ->
                                         ?PROXY_MASTER).
 
 children_appliedclocks(Node, Clocks) ->
-    riak_core_vnode_master:sync_command(Node,
-                                        {children_appliedclocks, Clocks},
-                                        ?PROXY_MASTER).
+    riak_core_vnode_master:command(Node,
+                                   {children_appliedclocks, Clocks},
+                                   {fsm, undefines, self()},
+                                   ?PROXY_MASTER).
+
+leader_batches(Node, Clock, Batches) ->
+    riak_core_vnode_master:command(Node,
+                                   {leader_batches, Clock, Batches},
+                                   {fsm, undefines, self()},
+                                   ?PROXY_MASTER).
+
+remote_batch(Node, Clock, Batch) ->
+    riak_core_vnode_master:command(Node,
+                                   {remote_batch, Clock, Batch},
+                                   {fsm, undefines, self()},
+                                   ?PROXY_MASTER).
 
 init([Partition]) ->
     Manager = groups_manager:init_state(integer_to_list(Partition)),
@@ -204,10 +220,11 @@ init([Partition]) ->
     Staleness = ?STALENESS:init(NameStaleness),
     {ok, Ring} = riak_core_ring_manager:get_my_ring(),
     GrossPrefLists = riak_core_ring:all_preflists(Ring, 1),
-    Parent = find_parent(GrossPrefLists, node()),
+    {Parent, Children} = find_parent_and_children(GrossPrefLists, none, [], node()),
     ?LOG_INFO("Vnode init ~p", [self()]),
     {ok, #state{partition=Partition,
                 parent=Parent,
+                children=Children,
                 applied_clocks=[],
                 gathered_clocks=[],
                 max_ts=0,
@@ -286,7 +303,7 @@ handle_command({set_groups, Groups}, _From, S0=#state{manager=Manager}) ->
     {reply, ok, S0};
 
 handle_command({children_appliedclocks, Clocks}, _From, S0=#state{gathered_clocks=List0}) ->
-    ?LOG_INFO("Received applied clocks ~p.", [Clocks]),
+    %?LOG_INFO("Received applied clocks ~p.", [Clocks]),
     List1 = lists:merge(List0, Clocks), 
     {noreply, S0#state{gathered_clocks=List1}};
 
@@ -294,16 +311,16 @@ handle_command({data, Id, BKey, Value}, _From, S0=#state{data=Data,
                                                          pending=Pending0,
                                                          applied_clocks=AppliedClocks0,
                                                          remote_updates=RemoteUpdates0}) ->
-    ?LOG_INFO("Remote data. key ~p, value ~p.", [BKey, Value]),
+    %?LOG_INFO("Remote data. key ~p, value ~p.", [BKey, Value]),
     case lists:reverse(Pending0) of
         [{Id, {Sender, Clock}}|Tail] ->
             {TimeStamp, _} = Id,
             RemoteUpdates1 = orddict:store(Clock, {BKey, Value, TimeStamp, Sender}, RemoteUpdates0),
-            {RemoteUpdates2, Pending1, AppliedClocks1} = process_pending_metadata(Tail, Data, RemoteUpdates1, [Clock]),
+            {RemoteUpdates2, Pending1, AppliedClocks1} = process_pending_metadata(Tail, Data, RemoteUpdates1, [Clock | AppliedClocks0]),
+            %?LOG_INFO("Adding to applied clocks. MyId ~p, before ~p, after ~p", [MyId, AppliedClocks0, AppliedClocks1]),
             %{RemoteUpdates2, Connector1, Staleness1} = process_pending_remote_updates(RemoteUpdates1, RClock, MyId, Connector0, Staleness0),
-            AppliedClocks2 = [AppliedClocks1 | AppliedClocks0],
             %saturn_leaf_converger:handle(MyId, {completed, AppliedClock}),
-            {noreply, S0#state{remote_updates=RemoteUpdates2, pending=Pending1, applied_clocks=AppliedClocks2}};
+            {noreply, S0#state{remote_updates=RemoteUpdates2, pending=Pending1, applied_clocks=AppliedClocks1}};
         _ ->
             true = ets:insert(Data, {Id, {BKey, Value}}),
             {noreply, S0}
@@ -347,36 +364,46 @@ handle_command({async_update, BKey, Value, Clock, Client}, _From, S0) ->
     gen_server:reply(Client, {ok, TimeStamp}),
     {noreply, S1};
 
-handle_command({propagate, TimeStamp, Node, Sender, RClock}, _From, S0=#state{data=Data, pending=Pending, remote_updates=RemoteUpdates0, applied_clocks=AppliedClocks}) ->
-    Id = {TimeStamp, Node},
-    ?LOG_INFO("Remote metadata. Clock ~p.", [RClock]),
-    case ets:lookup(Data, Id) of
-        [] ->
-            %saturn_leaf_converger:handle(MyId, {completed, IndexNode, RClock}),
-            {noreply, S0#state{pending=[{Id, {Sender, RClock}}|Pending]}};
-        [{Id, {BKey, Value}}] ->
-            RemoteUpdates1 = orddict:store(RClock, {BKey, Value, TimeStamp, Sender}, RemoteUpdates0),
-            case Pending of
-                [] ->
-                    %saturn_leaf_converger:handle(MyId, {completed, [RClock]})
-                    {noreply, S0#state{remote_updates=RemoteUpdates1, applied_clocks=[RClock | AppliedClocks]}};
-                _ ->
-                    {noreply, S0#state{remote_updates=RemoteUpdates1}}
-            end
+handle_command({remote_batch, Clock, LabelClocks}, _From, S0=#state{remote_clock=RClock0}) ->
+    %?LOG_INFO("Remote batch. MyId: ~p. New clock ~p, old clock ~p. Labels: ~p", [MyId, Clock, RClock0, LabelClocks]),
+    S2 = lists:foldl(fun({Label, Ts}, S1) ->
+                        handle_remote_label(Label, Ts, S1) 
+                     end, S0, LabelClocks),
+    case (Clock /= same) and (Clock > RClock0) of
+        true ->
+            S3 = do_update_rclock(Clock, S2),
+            {noreply, S3};
+        false ->   
+            {noreply, S2}
     end;
 
-handle_command({new_remote_clock, Clock}, _From, S0=#state{remote_clock=RClock0}) ->
-    ?LOG_INFO("New remote clock. New clock ~p, old clock ~p.", [Clock, RClock0]),
-    case Clock > RClock0 of
-        true ->
-            S1 = do_update_rclock(Clock, S0),
-            {noreply, S1};
-        false ->    
-            {noreply, S0}
-    end;
+handle_command({leader_batches, Clock, List}, _From, S0=#state{children=Children}) ->
+    %?LOG_INFO("New remote clock. New clock ~p, old clock ~p.", [Clock, RClock0]),
+    %?LOG_INFO("Leader batches. Clock: ~p, Batch: ~p", [Clock, List]),
+    Dict = lists:foldl(fun({Partition, Label, Ts}, Acc) ->
+                        dict:append(Partition, {Label, Ts}, Acc)
+                       end, dict:new(), List),
+    case Clock of
+        same ->
+            lists:foreach(fun({Partition, LabelsClocks}) ->
+                            %?LOG_INFO("Sending batch. Batch: ~p to ~p", [LabelsClocks, Partition]),
+                            saturn_proxy_vnode:remote_batch({Partition, node()}, Clock, LabelsClocks)
+                          end, dict:to_list(Dict));
+        _ ->
+            lists:foreach(fun(Partition) ->
+                            case dict:take(Partition, Dict) of
+                                {LabelsClocks, _} ->
+                                    %?LOG_INFO("Sending batch. Batch: ~p to ~p", [LabelsClocks, Partition]),
+                                    saturn_proxy_vnode:remote_batch({Partition, node()}, Clock, LabelsClocks);
+                                error ->
+                                    saturn_proxy_vnode:remote_batch({Partition, node()}, Clock, [])
+                            end
+                          end, Children)
+    end,
+    {noreply, S0};
 
 handle_command({remote_read, Label, Clock}, _From, S0=#state{remote_reads=PendingReads, remote_clock=RClock, max_ts=MaxTs0, myid=MyId, partition=Partition, connector=Connector0, staleness=Staleness0}) ->
-    ?LOG_INFO("Remote read. Clock ~p, remote clock: ~p", [Clock, RClock]),
+    %?LOG_INFO("Remote read. Clock ~p, remote clock: ~p", [Clock, RClock]),
     case RClock >= Clock of
         true ->
             {MaxTs1, LastLabel1, Staleness1} = do_remote_read(Label, MaxTs0, MyId, Partition, Connector0, Staleness0),
@@ -398,7 +425,7 @@ handle_command(heartbeat, _From, S0=#state{partition=Partition, max_ts=MaxTS0, m
     end;
 
 handle_command(periodic_dissemination, _From, S0=#state{parent=Parent, partition=Partition, applied_clocks=AppliedClocks, gathered_clocks=GatheredClocks0, myid=MyId}) ->
-    ?LOG_INFO("Periodic dissemination", []),
+    %?LOG_INFO("Periodic dissemination", []),
     riak_core_vnode:send_command_after(?EUNOMIA_FREQ, periodic_dissemination),
     case Parent of
         Partition ->
@@ -406,6 +433,7 @@ handle_command(periodic_dissemination, _From, S0=#state{parent=Parent, partition
                 [] ->
                     {noreply, S0};
                 GatheredClocks1 ->
+                    %?LOG_INFO("Completed. MyId ~p, Clocks ~p", [MyId, GatheredClocks1]),
                     saturn_leaf_converger:handle(MyId, {completed, GatheredClocks1}),
                     {noreply, S0#state{applied_clocks=[], gathered_clocks=[]}}
             end;
@@ -520,9 +548,10 @@ do_update(BKey, Value, Clock, S0=#state{max_ts=MaxTS0, partition=Partition, myid
     end,
     {{ok, TimeStamp}, S1#state{max_ts=TimeStamp, last_label=Label}}.
 
-do_remote_update(BKey, Value, TimeStamp, Sender, _MyId, Connector0, Staleness0) ->
+do_remote_update(BKey, Value, TimeStamp, Sender, Connector0, Staleness0) ->
     Staleness1 = ?STALENESS:add_update(Staleness0, Sender, TimeStamp),
     {ok, {_, Clock}} = ?BACKEND_CONNECTOR:read(Connector0, {BKey}),
+    %?LOG_INFO("Installing remote update at ~p. Key: ~p, is installed? ~p", [MyId, BKey, Clock<TimeStamp]),
     case (Clock<TimeStamp) of
         true ->
             {ok, Connector1} = ?BACKEND_CONNECTOR:update(Connector0, {BKey, Value, TimeStamp}),
@@ -551,12 +580,31 @@ do_update_rclock(Clock, S0=#state{remote_updates=RemoteUpdates0, myid=MyId, conn
     {RemoteReads1, MaxTs1, LastLabel1, Staleness2} = process_pending_remote_reads(RemoteReads0, Clock, MaxTs0, MyId, Partition, Connector1, Staleness1, LastLabel0),
     S0#state{connector=Connector1, staleness=Staleness2, remote_updates=RemoteUpdates1, remote_reads=RemoteReads1, max_ts=MaxTs1, last_label=LastLabel1, remote_clock=Clock}.
 
+do_propagate(TimeStamp, Node, Sender, RClock, S0=#state{data=Data, pending=Pending, remote_updates=RemoteUpdates0, applied_clocks=AppliedClocks}) ->
+    Id = {TimeStamp, Node},
+    %?LOG_INFO("Remote metadata. Clock ~p.", [RClock]),
+    case ets:lookup(Data, Id) of
+        [] ->
+            %saturn_leaf_converger:handle(MyId, {completed, IndexNode, RClock}),
+            S0#state{pending=[{Id, {Sender, RClock}}|Pending]};
+        [{Id, {BKey, Value}}] ->
+            RemoteUpdates1 = orddict:store(RClock, {BKey, Value, TimeStamp, Sender}, RemoteUpdates0),
+            case Pending of
+                [] ->
+                    %saturn_leaf_converger:handle(MyId, {completed, [RClock]})
+                    %?LOG_INFO("Adding to applied clocks. MyId ~p, before ~p, after ~p", [MyId, AppliedClocks, [RClock | AppliedClocks]]),
+                    S0#state{remote_updates=RemoteUpdates1, applied_clocks=[RClock | AppliedClocks]};
+                _ ->
+                    S0#state{remote_updates=RemoteUpdates1}
+            end
+    end.
+
 process_pending_remote_updates([], _, _, Connector0, Staleness0) ->
     {[], Connector0, Staleness0};
 
 process_pending_remote_updates([{Clock, Args}|Rest]=_RemoteUpdates, RClock, MyId, Connector0, Staleness0) when Clock =< RClock ->
     {BKey, Value, TimeStamp, Sender} =  Args,
-    {Connector1, Staleness1} = do_remote_update(BKey, Value, TimeStamp, Sender, MyId, Connector0, Staleness0),
+    {Connector1, Staleness1} = do_remote_update(BKey, Value, TimeStamp, Sender, Connector0, Staleness0),
     process_pending_remote_updates(Rest, RClock, MyId, Connector1, Staleness1);
 
 process_pending_remote_updates(RemoteUpdates, _, _, Connector0, Staleness0) ->
@@ -587,14 +635,34 @@ process_pending_metadata([{Id, {Sender, Clock, _}}|Rest]=Pending, Data, RemoteUp
             {RemoteUpdates0, lists:reverse(Pending), AppliedClock}
     end.
 
-find_parent([], MyNode) ->
-    ?LOG_INFO("No partition in my node ~p", [MyNode]);
+find_parent_and_children([], Parent, Children, _MyNode) ->
+    {Parent, Children};
     
-find_parent([Head|Rest], MyNode) ->
+find_parent_and_children([Head|Rest], Parent, Children, MyNode) ->
     {Index, Node} = hd(Head),
-    case Node of
-        MyNode ->
-            Index;
+    case {Node, Parent} of
+        {MyNode, none} ->
+            find_parent_and_children(Rest, Index, [Index | Children], MyNode);
+        {MyNode, _} ->
+            find_parent_and_children(Rest, Parent, [Index | Children], MyNode);
         _ ->
-            find_parent(Rest, MyNode)
+            find_parent_and_children(Rest, Parent, Children, MyNode)
+    end.
+
+handle_remote_label(Label, RemoteTs, S0=#state{remote_reads=PendingReads, remote_clock=RClock, max_ts=MaxTs0, myid=MyId, partition=Partition, connector=Connector0, staleness=Staleness0}) ->
+    case Label#label.operation of
+        remote_read ->
+            %?LOG_INFO("Remote read. Clock ~p, remote clock: ~p", [RemoteTs, RClock]),
+            case RClock >= RemoteTs of
+                true ->
+                    {MaxTs1, LastLabel1, Staleness1} = do_remote_read(Label, MaxTs0, MyId, Partition, Connector0, Staleness0),
+                    S0#state{max_ts=MaxTs1, last_label=LastLabel1, staleness=Staleness1};
+                false ->
+                    S0#state{remote_reads=orddict:append(RemoteTs, Label, PendingReads)}
+            end;
+        update ->
+            Clock = Label#label.timestamp,
+            Node = Label#label.node,
+            Sender = Label#label.sender,
+            do_propagate(Clock, Node, Sender, RemoteTs, S0)
     end.

@@ -39,7 +39,8 @@
                 stable,
                 old_stable,
                 remote_clock,
-                partitions,
+                leaders,
+                batches,
                 myid}).
                
 reg_name(MyId) ->  list_to_atom(integer_to_list(MyId) ++ atom_to_list(?MODULE)). 
@@ -48,7 +49,7 @@ start_link(MyId) ->
     gen_server:start({global, reg_name(MyId)}, ?MODULE, [MyId], []).
 
 handle(MyId, Message) ->
-    ?LOG_INFO("New message: ~p.", [Message]),
+    %?LOG_INFO("New message: ~p.", [Message]),
     gen_server:cast({global, reg_name(MyId)}, Message).
 
 clean_state(MyId) ->
@@ -58,15 +59,22 @@ init([MyId]) ->
     %Name = list_to_atom(integer_to_list(MyId) ++ "converger_queue"),
     {ok, Ring} = riak_core_ring_manager:get_my_ring(),
     GrossPrefLists = riak_core_ring:all_preflists(Ring, 1),
-    Dict = lists:foldl(fun(PrefList, Acc) ->
-                        dict:store(hd(PrefList), 0, Acc)
-                       end, dict:new(), GrossPrefLists),
+    {Leaders1, Batches1} = lists:foldl(fun(PrefList, {Leaders0, Batches0}) ->
+                                            {_Partition, Node} = hd(PrefList),
+                                            case dict:is_key(Node, Batches0) of
+                                                true ->
+                                                    {Leaders0, Batches0};
+                                                false ->
+                                                    {[hd(PrefList) | Leaders0], dict:store(Node, [], Batches0)}
+                                            end
+                                           end, {[], dict:new()}, GrossPrefLists),
     erlang:send_after(?EUNOMIA_FREQ, self(), notify),
     {ok, #state{pending_timestamps=[],
                 stable=0,
                 old_stable=0,
                 remote_clock=0,
-                partitions=dict:fetch_keys(Dict),
+                leaders=Leaders1,
+                batches=Batches1,
                 myid=MyId}}.
 
 handle_call(clean_state, _From, S0) ->
@@ -78,29 +86,41 @@ handle_cast({completed, TimeStamps0}, S0=#state{stable=Stable0, pending_timestam
     {PendingTS2, Stable2} = update_stable(PendingTS1, Stable1),
     {noreply, S0#state{stable=Stable2, pending_timestamps=PendingTS2}};
 
-handle_cast({new_stream, Stream, _SenderId}, S0=#state{remote_clock=RClock0}) ->
-    ?LOG_INFO("New stream: ~p.", [Stream]),
-    RClock2= lists:foldl(fun(Label, RClock1) ->
-                            handle_label(Label, RClock1)
-                         end, RClock0, Stream),
-    {noreply, S0#state{remote_clock=RClock2}};
+handle_cast({new_stream, Stream, _SenderId}, S0=#state{remote_clock=RClock0, batches=Batches0}) ->
+    %?LOG_INFO("New stream: ~p.", [Stream]),
+    {RClock2, Batches2} = lists:foldl(fun(Label, {RClock1, Batches1}) ->
+                                        batch_label(Label, RClock1, Batches1)
+                                      end, {RClock0, Batches0}, Stream),
+    {noreply, S0#state{remote_clock=RClock2, batches=Batches2}};
 
 handle_cast(_Info, State) ->
     {noreply, State}.
 
-handle_info(notify, S0=#state{myid=_MyId, old_stable=OldStable0, stable=Stable, partitions=Partitions}) ->
+handle_info(notify, S0=#state{myid=_MyId, old_stable=OldStable, stable=Stable, leaders=Leaders, batches=Batches}) ->
     %?LOG_INFO("Compute stable. New stable ~p, old ~p.", [Stable, OldStable0]),
-    case OldStable0 < Stable of
+    erlang:send_after(?EUNOMIA_FREQ, self(), notify),
+    case OldStable < Stable of
         true ->
-            lists:foreach(fun(Partition) ->
-                            saturn_proxy_vnode:new_remote_clock(Partition, Stable)
-                          end, Partitions);
+            Clock = Stable;
         false ->
-            noop
+            Clock = same
     end,
-    %erlang:send_after(?STABILIZATION_FREQ, self(), notify),
-    erlang:send_after(100, self(), notify),
-    {noreply, S0#state{old_stable=Stable}};
+    Batches2 = lists:foldl(fun({_Partition, Node}=IndexNode, Batches1) ->
+                            case dict:fetch(Node, Batches1) of
+                                [] ->
+                                    case Clock of
+                                        same ->
+                                            noop;
+                                        _ ->
+                                            saturn_proxy_vnode:leader_batches(IndexNode, Clock, [])
+                                    end,
+                                    Batches1;
+                                BatchNode ->
+                                    saturn_proxy_vnode:leader_batches(IndexNode, Clock, BatchNode),
+                                    dict:store(Node, [], Batches1)
+                            end
+                           end, Batches, Leaders),
+    {noreply, S0#state{old_stable=Stable, batches=Batches2}};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -111,18 +131,8 @@ terminate(_Reason, _State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-handle_label(empty, Queue) ->
-    Queue;
-
-handle_label(Label, RClock) ->
+batch_label(Label, RClock, Batches0) ->
     case Label#label.operation of
-        remote_read ->
-            BKey = Label#label.bkey,
-            DocIdx = riak_core_util:chash_key(BKey),
-            PrefList = riak_core_apl:get_primary_apl(DocIdx, 1, ?PROXY_SERVICE),
-            [{IndexNode, _Type}] = PrefList,
-            saturn_proxy_vnode:remote_read(IndexNode, Label, RClock),
-            RClock;
         remote_reply ->
             Payload = Label#label.payload,
             Client = Payload#payload_reply.client,
@@ -135,19 +145,26 @@ handle_label(Label, RClock) ->
                     gen_server:reply(Client, {ok, {Value, 0}, RClock})
                     %noop
             end,
-            RClock;
-        update ->
+            {RClock, Batches0};
+        remote_read ->
             BKey = Label#label.bkey,
-            Clock = Label#label.timestamp,
-            Node = Label#label.node,
-            Sender = Label#label.sender,
             DocIdx = riak_core_util:chash_key(BKey),
             PrefList = riak_core_apl:get_primary_apl(DocIdx, 1, ?PROXY_SERVICE),
             [{IndexNode, _Type}] = PrefList,
-            saturn_proxy_vnode:propagate(IndexNode, Clock, Node, Sender, RClock+1),
-            RClock+1
+            {Partition, Node} = IndexNode,
+            Batches1 = dict:append(Node, {Partition, Label, RClock}, Batches0),
+            {RClock, Batches1};
+        update ->
+            BKey = Label#label.bkey,
+            DocIdx = riak_core_util:chash_key(BKey),
+            PrefList = riak_core_apl:get_primary_apl(DocIdx, 1, ?PROXY_SERVICE),
+            [{IndexNode, _Type}] = PrefList,
+            {Partition, Node} = IndexNode,
+            Batches1 = dict:append(Node, {Partition, Label, RClock+1}, Batches0),
+            %?LOG_INFO("Converger ~p, Bkey ~p, RClock ~p", [MyId, BKey, RClock+1]),
+            {RClock+1, Batches1}
     end.
-
+    
 update_stable([], Stable) ->
     {[], Stable};
 

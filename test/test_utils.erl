@@ -47,7 +47,8 @@
     heal_cluster/2,
     set_up_clusters_common/1,
     unpack/1,
-    server_name/1
+    server_name/1,
+    log_config/1
 ]).
 
 %% ===========================================

@@ -39,10 +39,16 @@
          all/0
         ]).
 
+%% spawn
+-export([
+         spawn_update/2
+        ]).
+
 %% tests
 -export([
          replication/1,
-         remote_read/1
+         remote_read/1,
+         parallel_updates/1
         ]).
 
 -include_lib("common_test/include/ct.hrl").
@@ -67,7 +73,8 @@ end_per_testcase(Name, _) ->
 
 all() ->
     [replication,
-    remote_read 
+    remote_read,
+    parallel_updates 
     ].
 
 server_name(Node)->
@@ -79,9 +86,9 @@ eventual_read(Key, RClock, Node, ExpectedResult) ->
 eventual_read(Key, Node, ExpectedResult, LClock, RClock) ->
     Result = gen_server:call(server_name(Node), {read, Key, LClock, RClock}, infinity),
     case Result of
-        {ok, {ExpectedResult, _Clock}, RClock1} -> Result;
+        {ok, {ExpectedResult, _Clock}, _RClock1} -> Result;
         {ok, {_, _}, RClock1} ->
-            ct:print("I read: ~p, expecting: ~p",[Result, ExpectedResult]),
+            ct:print("Key: ~p, read: ~p, expected: ~p",[Key, Result, ExpectedResult]),
             timer:sleep(500),
             eventual_read(Key, RClock1, Node, ExpectedResult)
     end.
@@ -129,3 +136,37 @@ remote_read(Config) ->
 
     Result4 = eventual_read(BKey, 0, Leaf2, 3),
     ?assertMatch({ok, {3, _Clock1}, 1}, Result4).
+
+parallel_updates(Config) ->
+    ct:print("Starting test parallel_updates", []),
+
+    Bucket = 2,
+    [Leaf1 | Leaf2] = proplists:get_value(leafs, Config),
+    Max = 100,
+    Clients = lists:seq(1, Max), 
+
+    lists:foreach(fun(Key) ->
+                    BKey = {Bucket, Key},
+                    case Key/Max > 0.5 of
+                        false ->
+                            Node = Leaf1;
+                        true ->
+                            Node = Leaf2
+                    end,
+                    spawn(saturn_SUITE, spawn_update, [Node, BKey])
+                  end, Clients),
+
+    lists:foreach(fun(Key) ->
+                    BKey = {Bucket, Key},
+                    case Key/Max > 0.5 of
+                        false ->
+                            Node = Leaf2;
+                        true ->
+                            Node = Leaf1
+                    end,
+                    Result = eventual_read(BKey, 0, Node, 3),
+                    ?assertMatch({ok, {3, _Clock}, _RClock}, Result)
+                  end, Clients).
+
+spawn_update(Node, BKey) ->
+    gen_server:call(server_name(Node), {update, BKey, 3, 0}, infinity).

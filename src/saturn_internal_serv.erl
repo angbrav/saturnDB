@@ -38,7 +38,7 @@ start_link(MyId) ->
     gen_server:start_link({global, reg_name(MyId)}, ?MODULE, [MyId], []).
 
 handle(MyId, Message) ->
-    ?LOG_INFO("New message at internal ~p: ~p.", [MyId, Message]),
+    %?LOG_INFO("New message at internal ~p: ~p.", [MyId, Message]),
     gen_server:cast({global, reg_name(MyId)}, Message).
 
 restart(MyId) ->
@@ -204,7 +204,7 @@ propagate_stream(Node, Stream, MyId, NLeaves) ->
     %lager:info("Stream to propagate to ~p: ~p", [Node, Stream]),
     case groups_manager:is_leaf(Node, NLeaves) of
         true ->
-            ?LOG_INFO("~p sending new stream: ~p to converger ~p.", [MyId, Stream, Node]),
+            %?LOG_INFO("~p sending new stream: ~p to converger ~p.", [MyId, Stream, Node]),
             saturn_leaf_converger:handle(Node, {new_stream, Stream, MyId});
         false ->
             saturn_internal_serv:handle(Node, {new_stream, Stream, MyId})
