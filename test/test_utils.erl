@@ -75,7 +75,7 @@ log(#{msg := Msg}, _Config) ->
         {Format, Terms} ->
             io_lib:format(Format, Terms)
     end,
-    _ = erpc:call(Master, ct, log, [Arg]).
+    _ = rpc:call(Master, ct, log, [Arg]).
 
 %% ===========================================
 %% Common Test Initialization
@@ -229,14 +229,14 @@ start_node(Name, Config) ->
 
 
 
-            ok = erpc:call(Node, logger, set_primary_config, [level, all]),
-            ok = erpc:call(Node, application, set_env, [saturn_leaf, ct_master, node()]),
+            ok = rpc:call(Node, logger, set_primary_config, [level, all]),
+            ok = rpc:call(Node, application, set_env, [saturn_leaf, ct_master, node()]),
             ConfLog = #{level => info,
                         formatter => {logger_formatter, #{single_line => true,
                                                           max_size => 2048}},
                         config => #{type => standard_io}},
 
-            ok = erpc:call(Node, logger, add_handler, [saturn_leaf_ct_redirect, ?MODULE, ConfLog]),
+            ok = rpc:call(Node, logger, add_handler, [saturn_leaf_ct_redirect, ?MODULE, ConfLog]),
 
 
             %% redirect slave logs to ct_master logs
