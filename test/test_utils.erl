@@ -108,7 +108,7 @@ init_multi_dc(Suite, Config0) ->
     ct:pal("[~p]", [Suite]),
     ct:log("Starting init_multi_dc ~p", [Suite]),
 
-    Config = [{groups_file, "config/buckets/two_leafs_buckets.txt"} | [{tree_file, "config/trees/two_leafs_one_internal.txt"} | Config0]],
+    Config = [{groups_file, "buckets/two_leafs_buckets.txt"} | [{tree_file, "trees/two_leafs_one_internal.txt"} | Config0]],
 
     at_init_testsuite(),
 
@@ -178,6 +178,7 @@ start_node(Name, Config) ->
     {ok, Cwd} = file:get_cwd(),
     SaturnFolder = filename:dirname(filename:dirname(Cwd)),
     PrivDir = proplists:get_value(priv_dir, Config),
+    DataTestDir = proplists:get_value(data_dir, Config),
     NodeDir = filename:join([PrivDir, Name]) ++ "/",
     filelib:ensure_dir(NodeDir),
     ct:log("Saturn folder ~p", [SaturnFolder]),
@@ -249,8 +250,8 @@ start_node(Name, Config) ->
             TreeFile = proplists:get_value(tree_file, Config),
             GroupsFile = proplists:get_value(groups_file, Config),
 
-            ok = rpc:call(Node, application, set_env, [saturn_leaf, tree, "/Users/manuel.bravo/Projects/saturn_leaf/_build/default/rel/saturn_leaf/" ++ TreeFile]),
-            ok = rpc:call(Node, application, set_env, [saturn_leaf, groups, "/Users/manuel.bravo/Projects/saturn_leaf/_build/default/rel/saturn_leaf/" ++ GroupsFile]),
+            ok = rpc:call(Node, application, set_env, [saturn_leaf, tree, DataTestDir ++ TreeFile]),
+            ok = rpc:call(Node, application, set_env, [saturn_leaf, groups, DataTestDir ++ GroupsFile]),
             %% reduce number of actual log files created to 4, reduces start-up time of node
             ok = rpc:call(Node, application, set_env, [riak_core, ring_creation_size, 4]),
             %ok = rpc:call(Node, application, set_env, [antidote, sync_log, true]),
