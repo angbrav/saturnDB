@@ -32,7 +32,5 @@
                  ]},
   {mod, { saturn_leaf_app, []}},
   {env, [{riak_node, '127.0.0.1'},
-         {tree, "config/trees/tree_sevenec2_uniform.txt"},
-         {groups, "config/buckets/seven_leafs_buckets.txt"},
          {riak_port, 7878}]}
  ]}.

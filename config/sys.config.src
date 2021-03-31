@@ -42,8 +42,9 @@
 
  {saturn_leaf, [
             %% antidote data directory
-           {data_dir, "${ROOT_DIR_PREFIX}${DATA_DIR_PREFIX}data_antidote"}
-
+           {data_dir, "${ROOT_DIR_PREFIX}${DATA_DIR_PREFIX}data_antidote"},
+           {tree, "config/trees/${TREE_FILE}"},
+           {groups, "config/buckets/${BUCKETS_FILE}"}
            %{riak_port, {{riak_port}} },
            %{riak_node, '127.0.0.1'}
           ]},
